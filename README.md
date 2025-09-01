@@ -1,4 +1,4 @@
-## UBOS ISIC Code Mapper
+## Industry Classification Code Mapper
 
 This project provides a web interface for mapping industry descriptions to ISIC (International Standard Industrial Classification) codes using Qdrant and SentenceTransformers. It allows users to upload files containing industry descriptions and automatically maps them to relevant ISIC codes using semantic search techniques.
 

@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip install:*)",
+      "Bash(streamlit run:*)",
+      "Bash(python:*)",
+      "Read(c:\\Users\\allan.agaba\\Documents\\GitHub\\UBOS-ISCO-CODE-MAPPER/**)",
+      "Read(c:\\Users\\allan.agaba\\Documents\\GitHub\\UBOS-ISCO-CODE-MAPPER/**)",
+      "Read(c:\\Users\\allan.agaba\\Documents\\GitHub\\UBOS-ISCO-CODE-MAPPER/**)",
+      "Bash(copy:*)",
+      "Bash(taskkill:*)",
+      "Bash(rm:*)",
+      "Bash(chmod:*)",
+      "Bash(dir)",
+      "Bash(git commit:*)",
+      "Bash(git push:*)",
+      "Bash(git reset:*)",
+      "Bash(git add:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
