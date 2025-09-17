@@ -94,7 +94,8 @@ def upsert_in_batches(vectors, qdrant, data_dict, collection_name="industries", 
                 vector=vectors[j],
                 payload={
                     "code": data_dict[j]['code'],
-                    "title": data_dict[j]['title']
+                    "title": data_dict[j]['title'],
+                    "level": data_dict[j].get('level', 'Unknown')
                 }
             ) for j in range(i, min(i + batch_size, len(vectors)))
         ]
@@ -143,10 +144,18 @@ def load_and_encode_classification_data(classification_type, _qdrant, _encoder):
             data_df = pd.read_excel(data_path, sheet_name='ISIC-Rev4')
             st.write("ISIC data loaded successfully.")
             
-            # Clean the data - use 4-digit ISIC codes
-            data_df = data_df[data_df["ISIC-Code"].astype(str).str.len() == 4]
+            # Include both Level 2 (2-digit) and Level 4 (4-digit) ISIC codes
+            data_df = data_df[data_df["ISIC-Code"].astype(str).str.len().isin([2, 4])]
             data_df["text"] = data_df["ISIC-Sub Activity Description"].fillna("")
-            data_dict = data_df[["ISIC-Code", "ISIC-Sub Activity Description", "text"]].rename(columns={"ISIC-Sub Activity Description": "title", "ISIC-Code": "code"}).to_dict(orient="records")
+
+            # Add level information for clearer identification
+            data_df["level"] = data_df["ISIC-Code"].astype(str).str.len().map({2: "Level 2", 4: "Level 4"})
+
+            data_dict = data_df[["ISIC-Code", "ISIC-Sub Activity Description", "text", "level"]].rename(columns={"ISIC-Sub Activity Description": "title", "ISIC-Code": "code"}).to_dict(orient="records")
+
+            level_2_count = len([d for d in data_dict if d["level"] == "Level 2"])
+            level_4_count = len([d for d in data_dict if d["level"] == "Level 4"])
+            st.write(f"Loaded {level_2_count} Level 2 (Division) and {level_4_count} Level 4 (Class) ISIC codes")
             
         except Exception as e:
             st.error(f"Error loading ISIC data: {e}")
@@ -244,12 +253,31 @@ def find_top_3_classification_codes_batch(industries, encoder, qdrant, collectio
             # Process each vector in the search batch
             for k, vector in enumerate(search_batch):
                 hits = qdrant.search(
-                    collection_name=collection_name, 
-                    query_vector=vector.tolist(), 
-                    limit=3
+                    collection_name=collection_name,
+                    query_vector=vector.tolist(),
+                    limit=6  # Get more results to ensure we have both levels
                 )
-                codes = [hit.payload.get('code') for hit in hits]
-                batch_results.append(codes + [None] * (3 - len(codes)))
+
+                # Separate level 2 and level 4 codes
+                level_2_codes = []
+                level_4_codes = []
+
+                for hit in hits:
+                    code = hit.payload.get('code')
+                    level = hit.payload.get('level', 'Unknown')
+
+                    if level == 'Level 2' and len(level_2_codes) < 3:
+                        level_2_codes.append(code)
+                    elif level == 'Level 4' and len(level_4_codes) < 3:
+                        level_4_codes.append(code)
+
+                # Pad with None to ensure 3 results each
+                level_2_codes += [None] * (3 - len(level_2_codes))
+                level_4_codes += [None] * (3 - len(level_4_codes))
+
+                # Combine results: [level2_1, level2_2, level2_3, level4_1, level4_2, level4_3]
+                combined_results = level_2_codes + level_4_codes
+                batch_results.append(combined_results)
                 
                 # Update processed count and progress for individual items within batch
                 processed_count += 1
@@ -503,9 +531,19 @@ def process_file_with_fine_tuned(uploaded_file, fine_tuned_classifier, save_dire
         # Get predictions for batch
         batch_predictions = []
         for text in batch:
-            predictions = fine_tuned_classifier.predict_single(text, top_k=3)
-            codes = [pred['code'] for pred in predictions] + [None] * (3 - len(predictions))
-            batch_predictions.append(codes)
+            predictions = fine_tuned_classifier.predict_single(text, top_k=6)  # Get more predictions
+
+            # Extract level 4 codes and derive level 2 codes
+            level_4_codes = [pred['code'] for pred in predictions if len(pred['code']) == 4][:3]
+            level_2_codes = list(dict.fromkeys([code[:2] for code in level_4_codes if len(code) == 4]))[:3]  # Remove duplicates, keep order
+
+            # Pad with None to ensure 3 results each
+            level_2_codes += [None] * (3 - len(level_2_codes))
+            level_4_codes += [None] * (3 - len(level_4_codes))
+
+            # Combine results: [level2_1, level2_2, level2_3, level4_1, level4_2, level4_3]
+            combined_codes = level_2_codes + level_4_codes
+            batch_predictions.append(combined_codes)
         
         batch_results.extend(batch_predictions)
         
@@ -523,11 +561,15 @@ def process_file_with_fine_tuned(uploaded_file, fine_tuned_classifier, save_dire
             full_results.append(batch_results[batch_idx])
             batch_idx += 1
         else:
-            full_results.append([None, None, None])
-    
-    # Add results to dataframe
-    results_df = pd.DataFrame(full_results, columns=['isic_code_1', 'isic_code_2', 'isic_code_3'])
-    df[['isic_code_1', 'isic_code_2', 'isic_code_3']] = results_df
+            full_results.append([None, None, None, None, None, None])  # 6 columns for both levels
+
+    # Add results to dataframe with both level 2 and level 4 classifications
+    results_df = pd.DataFrame(full_results, columns=[
+        'isic_level2_code_1', 'isic_level2_code_2', 'isic_level2_code_3',
+        'isic_level4_code_1', 'isic_level4_code_2', 'isic_level4_code_3'
+    ])
+    df[['isic_level2_code_1', 'isic_level2_code_2', 'isic_level2_code_3',
+        'isic_level4_code_1', 'isic_level4_code_2', 'isic_level4_code_3']] = results_df
     
     # Save file
     name_parts = uploaded_file.name.rsplit('.', 1)
@@ -619,7 +661,7 @@ def run_accuracy_test(test_file, encoder, qdrant, fine_tuned_classifier, classif
         # Filter valid test data
         test_df = test_df.dropna(subset=['INDUSTRY', expected_col])
         test_df = test_df[test_df['INDUSTRY'].str.len() > 2]
-        test_df = test_df[test_df[expected_col].astype(str).str.len() == 4]  # 4-digit ISIC codes
+        test_df = test_df[test_df[expected_col].astype(str).str.len().isin([2, 4])]  # Both level 2 and 4 ISIC codes
         
         if len(test_df) == 0:
             st.error("❌ No valid test data found after filtering")
@@ -857,22 +899,53 @@ def process_file_compact(uploaded_file, encoder, qdrant, save_directory, classif
                 batch_idx += 1
             else:
                 # Skip classification for invalid rows (empty INDUSTRY or isic_class)
-                full_results.append([None, None, None])
-        
-        results_df = pd.DataFrame(full_results, columns=[f'{classification_type.lower()}_code_1', f'{classification_type.lower()}_code_2', f'{classification_type.lower()}_code_3'])
+                if classification_type == "ISIC":
+                    full_results.append([None, None, None, None, None, None])  # 6 columns for both levels
+                else:
+                    full_results.append([None, None, None])  # ISCO remains 3 columns
+
+        if classification_type == "ISIC":
+            # ISIC with both level 2 and level 4 classifications
+            results_df = pd.DataFrame(full_results, columns=[
+                'isic_level2_code_1', 'isic_level2_code_2', 'isic_level2_code_3',
+                'isic_level4_code_1', 'isic_level4_code_2', 'isic_level4_code_3'
+            ])
+        else:
+            # ISCO remains unchanged
+            results_df = pd.DataFrame(full_results, columns=[f'{classification_type.lower()}_code_1', f'{classification_type.lower()}_code_2', f'{classification_type.lower()}_code_3'])
     else:
-        results_df = pd.DataFrame(batch_results, columns=[f'{classification_type.lower()}_code_1', f'{classification_type.lower()}_code_2', f'{classification_type.lower()}_code_3'])
+        if classification_type == "ISIC":
+            # ISIC with both level 2 and level 4 classifications
+            results_df = pd.DataFrame(batch_results, columns=[
+                'isic_level2_code_1', 'isic_level2_code_2', 'isic_level2_code_3',
+                'isic_level4_code_1', 'isic_level4_code_2', 'isic_level4_code_3'
+            ])
+        else:
+            # ISCO remains unchanged
+            results_df = pd.DataFrame(batch_results, columns=[f'{classification_type.lower()}_code_1', f'{classification_type.lower()}_code_2', f'{classification_type.lower()}_code_3'])
     
     # Add classification codes to the dataframe
-    df[[f'{classification_type.lower()}_code_1', f'{classification_type.lower()}_code_2', f'{classification_type.lower()}_code_3']] = results_df
+    if classification_type == "ISIC":
+        df[['isic_level2_code_1', 'isic_level2_code_2', 'isic_level2_code_3',
+            'isic_level4_code_1', 'isic_level4_code_2', 'isic_level4_code_3']] = results_df
+    else:
+        df[[f'{classification_type.lower()}_code_1', f'{classification_type.lower()}_code_2', f'{classification_type.lower()}_code_3']] = results_df
     
     # Remove temporary columns before saving
     df_output = df.drop(columns=['combined_text', 'is_valid_for_processing'], errors='ignore')
     
     # Reorder columns to put classification codes after the original columns
-    code_prefix = f'{classification_type.lower()}_code'
-    original_cols = [col for col in df_output.columns if not col.startswith(code_prefix)]
-    code_cols = [col for col in df_output.columns if col.startswith(code_prefix)]
+    if classification_type == "ISIC":
+        # For ISIC, we have both level 2 and level 4 codes
+        code_prefixes = ['isic_level2_code', 'isic_level4_code']
+        original_cols = [col for col in df_output.columns if not any(col.startswith(prefix) for prefix in code_prefixes)]
+        code_cols = [col for col in df_output.columns if any(col.startswith(prefix) for prefix in code_prefixes)]
+    else:
+        # For ISCO, keep existing logic
+        code_prefix = f'{classification_type.lower()}_code'
+        original_cols = [col for col in df_output.columns if not col.startswith(code_prefix)]
+        code_cols = [col for col in df_output.columns if col.startswith(code_prefix)]
+
     df_output = df_output[original_cols + code_cols]
     
     # Create processed filename with proper extension
@@ -954,12 +1027,35 @@ def find_top_3_classification_codes_compact(industries, encoder, qdrant, progres
         batch_results = []
         for vector in batch_vectors:
             hits = qdrant.search(
-                collection_name=collection_name, 
-                query_vector=vector.tolist(), 
-                limit=3
+                collection_name=collection_name,
+                query_vector=vector.tolist(),
+                limit=6 if collection_name == "industries" else 3  # Get more results for ISIC to ensure both levels
             )
-            codes = [hit.payload.get('code') for hit in hits]
-            batch_results.append(codes + [None] * (3 - len(codes)))
+
+            if collection_name == "industries":  # ISIC classification
+                # Separate level 2 and level 4 codes
+                level_2_codes = []
+                level_4_codes = []
+
+                for hit in hits:
+                    code = hit.payload.get('code')
+                    level = hit.payload.get('level', 'Unknown')
+
+                    if level == 'Level 2' and len(level_2_codes) < 3:
+                        level_2_codes.append(code)
+                    elif level == 'Level 4' and len(level_4_codes) < 3:
+                        level_4_codes.append(code)
+
+                # Pad with None to ensure 3 results each
+                level_2_codes += [None] * (3 - len(level_2_codes))
+                level_4_codes += [None] * (3 - len(level_4_codes))
+
+                # Combine results: [level2_1, level2_2, level2_3, level4_1, level4_2, level4_3]
+                combined_results = level_2_codes + level_4_codes
+                batch_results.append(combined_results)
+            else:  # ISCO classification
+                codes = [hit.payload.get('code') for hit in hits]
+                batch_results.append(codes + [None] * (3 - len(codes)))
             
             processed_count += 1
             

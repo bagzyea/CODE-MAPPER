@@ -23,7 +23,7 @@ def setup_models():
     # Setup Qdrant with ISIC data
     print("Setting up ISIC database...")
     df = pd.read_excel('Localised ISIC.xlsx', sheet_name='ISIC-Rev4')
-    df = df[df['ISIC-Code'].astype(str).str.len() == 4]
+    df = df[df['ISIC-Code'].astype(str).str.len().isin([2, 4])]
     df["text"] = df["ISIC-Sub Activity Description"].fillna("")
     
     qdrant = QdrantClient(":memory:")

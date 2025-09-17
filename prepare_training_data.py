@@ -11,8 +11,8 @@ from typing import List, Dict, Tuple
 def load_isic_data():
     """Load and preprocess ISIC data"""
     df = pd.read_excel('Localised ISIC.xlsx', sheet_name='ISIC-Rev4')
-    # Filter 4-digit codes
-    df = df[df['ISIC-Code'].astype(str).str.len() == 4]
+    # Include both Level 2 (2-digit) and Level 4 (4-digit) codes
+    df = df[df['ISIC-Code'].astype(str).str.len().isin([2, 4])]
     return df
 
 def create_text_variations(text: str) -> List[str]:

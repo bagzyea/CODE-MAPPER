@@ -14,7 +14,7 @@ def load_isic_data_for_qdrant():
     """Load ISIC data and create Qdrant collection"""
     print("Loading ISIC data for Qdrant...")
     df = pd.read_excel('Localised ISIC.xlsx', sheet_name='ISIC-Rev4')
-    df = df[df['ISIC-Code'].astype(str).str.len() == 4]
+    df = df[df['ISIC-Code'].astype(str).str.len().isin([2, 4])]
     
     # Create text data
     df["text"] = df["ISIC-Sub Activity Description"].fillna("")
@@ -91,7 +91,7 @@ def load_test_data(file_path):
         original_len = len(test_df)
         test_df = test_df.dropna(subset=['INDUSTRY', expected_col])
         test_df = test_df[test_df['INDUSTRY'].str.len() > 2]
-        test_df = test_df[test_df[expected_col].astype(str).str.len() == 4]
+        test_df = test_df[test_df[expected_col].astype(str).str.len().isin([2, 4])]
         
         print(f"Filtered to {len(test_df)} valid records (removed {original_len - len(test_df)} invalid)")
         
