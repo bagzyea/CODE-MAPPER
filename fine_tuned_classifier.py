@@ -98,27 +98,52 @@ class FineTunedISICClassifier:
         
         return results
     
-    def predict_batch(self, texts: List[str], top_k: int = 1) -> List[List[Dict]]:
+    def predict_batch(self, texts: List[str], top_k: int = 5) -> List[List[Dict]]:
         """
-        Predict ISIC codes for a batch of texts
+        Predict ISIC codes for a batch of texts using true batch inference
+        This is MUCH faster than calling predict_single() in a loop
         Returns list of predictions for each text
         """
         if self.model is None:
             raise RuntimeError("Model not loaded. Call load_model() first.")
         
-        results = []
-        # Process in batches for memory efficiency
-        batch_size = 32
+        if not texts:
+            return []
         
-        for i in range(0, len(texts), batch_size):
-            batch_texts = texts[i:i + batch_size]
-            batch_results = []
+        # Tokenize entire batch at once
+        inputs = self.tokenizer(
+            texts,
+            return_tensors="pt",
+            truncation=True,
+            padding=True,
+            max_length=128
+        )
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        
+        # Run batch inference
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            predictions = torch.nn.functional.softmax(outputs.logits, dim=-1)
+        
+        # Process all predictions
+        results = []
+        for i in range(len(texts)):
+            # Get top k predictions for this text
+            top_preds = torch.topk(predictions[i], k=min(top_k, predictions.size(1)))
             
-            for text in batch_texts:
-                prediction = self.predict_single(text, top_k=top_k)
-                batch_results.append(prediction)
+            text_results = []
+            for j in range(len(top_preds.values)):
+                confidence = top_preds.values[j].item()
+                predicted_class_id = top_preds.indices[j].item()
+                isic_code = self.label_mappings['id_to_label'][str(predicted_class_id)]
+                
+                text_results.append({
+                    'code': isic_code,
+                    'confidence': confidence,
+                    'title': f"ISIC {isic_code}"
+                })
             
-            results.extend(batch_results)
+            results.append(text_results)
         
         return results
     

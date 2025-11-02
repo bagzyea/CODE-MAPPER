@@ -14,6 +14,7 @@ from threading import Lock
 import threading
 from fine_tuned_classifier import FineTunedISICClassifier, get_classifier
 from sklearn.metrics import accuracy_score, classification_report
+from file_logger import log_successful_file, log_failed_file, get_failed_files
 
 # Initialize the Qdrant client, SentenceTransformer model, and fine-tuned classifier
 @st.cache_resource
@@ -144,14 +145,24 @@ def load_and_encode_classification_data(classification_type, _qdrant, _encoder):
             data_df = pd.read_excel(data_path, sheet_name='ISIC-Rev4')
             st.write("ISIC data loaded successfully.")
             
-            # Include both Level 2 (2-digit) and Level 4 (4-digit) ISIC codes
-            data_df = data_df[data_df["ISIC-Code"].astype(str).str.len().isin([2, 4])]
-            data_df["text"] = data_df["ISIC-Sub Activity Description"].fillna("")
+            # Create separate datasets for Level 2 (Divisions) and Level 4 (Classes)
 
-            # Add level information for clearer identification
-            data_df["level"] = data_df["ISIC-Code"].astype(str).str.len().map({2: "Level 2", 4: "Level 4"})
+            # Level 2: Get unique 2-digit divisions with their descriptions
+            divisions_df = data_df[['ISIC-Division', 'ISIC-Division Description']].drop_duplicates()
+            divisions_df = divisions_df[divisions_df['ISIC-Division'].astype(str).str.len() == 2].copy()
+            divisions_df['level'] = 'Level 2'
+            divisions_df['text'] = divisions_df['ISIC-Division Description'].fillna("")
+            divisions_df = divisions_df.rename(columns={'ISIC-Division': 'code', 'ISIC-Division Description': 'title'})
 
-            data_dict = data_df[["ISIC-Code", "ISIC-Sub Activity Description", "text", "level"]].rename(columns={"ISIC-Sub Activity Description": "title", "ISIC-Code": "code"}).to_dict(orient="records")
+            # Level 4: Get 4-digit class codes with their descriptions
+            classes_df = data_df[data_df["ISIC-Code"].astype(str).str.len() == 4].copy()
+            classes_df['level'] = 'Level 4'
+            classes_df['text'] = classes_df["ISIC-Sub Activity Description"].fillna("")
+            classes_df = classes_df[["ISIC-Code", "ISIC-Sub Activity Description", "text", "level"]].rename(columns={"ISIC-Sub Activity Description": "title", "ISIC-Code": "code"})
+
+            # Combine both levels
+            combined_df = pd.concat([divisions_df[['code', 'title', 'text', 'level']], classes_df[['code', 'title', 'text', 'level']]], ignore_index=True)
+            data_dict = combined_df.to_dict(orient="records")
 
             level_2_count = len([d for d in data_dict if d["level"] == "Level 2"])
             level_4_count = len([d for d in data_dict if d["level"] == "Level 4"])
@@ -208,7 +219,7 @@ def load_and_encode_classification_data(classification_type, _qdrant, _encoder):
     return data_df
 
 # Batch processing function for finding top 3 classification codes - WITH DETAILED PROGRESS TRACKING
-def find_top_3_classification_codes_batch(industries, encoder, qdrant, collection_name="industries", batch_size=256):
+def find_top_3_classification_codes_batch(industries, encoder, qdrant, collection_name="industries", batch_size=256, level_2_only=False):
     all_results = []
     total_items = len(industries)
     processed_count = 0
@@ -258,26 +269,39 @@ def find_top_3_classification_codes_batch(industries, encoder, qdrant, collectio
                     limit=6  # Get more results to ensure we have both levels
                 )
 
-                # Separate level 2 and level 4 codes
-                level_2_codes = []
-                level_4_codes = []
+                if level_2_only:
+                    # Only return Level 2 codes
+                    level_2_codes = []
+                    for hit in hits:
+                        code = hit.payload.get('code')
+                        level = hit.payload.get('level', 'Unknown')
+                        if level == 'Level 2' and len(level_2_codes) < 3:
+                            level_2_codes.append(code)
 
-                for hit in hits:
-                    code = hit.payload.get('code')
-                    level = hit.payload.get('level', 'Unknown')
+                    # Pad with None to ensure 3 results
+                    level_2_codes += [None] * (3 - len(level_2_codes))
+                    batch_results.append(level_2_codes)
+                else:
+                    # Separate level 2 and level 4 codes
+                    level_2_codes = []
+                    level_4_codes = []
 
-                    if level == 'Level 2' and len(level_2_codes) < 3:
-                        level_2_codes.append(code)
-                    elif level == 'Level 4' and len(level_4_codes) < 3:
-                        level_4_codes.append(code)
+                    for hit in hits:
+                        code = hit.payload.get('code')
+                        level = hit.payload.get('level', 'Unknown')
 
-                # Pad with None to ensure 3 results each
-                level_2_codes += [None] * (3 - len(level_2_codes))
-                level_4_codes += [None] * (3 - len(level_4_codes))
+                        if level == 'Level 2' and len(level_2_codes) < 3:
+                            level_2_codes.append(code)
+                        elif level == 'Level 4' and len(level_4_codes) < 3:
+                            level_4_codes.append(code)
 
-                # Combine results: [level2_1, level2_2, level2_3, level4_1, level4_2, level4_3]
-                combined_results = level_2_codes + level_4_codes
-                batch_results.append(combined_results)
+                    # Pad with None to ensure 3 results each
+                    level_2_codes += [None] * (3 - len(level_2_codes))
+                    level_4_codes += [None] * (3 - len(level_4_codes))
+
+                    # Combine results: [level2_1, level2_2, level2_3, level4_1, level4_2, level4_3]
+                    combined_results = level_2_codes + level_4_codes
+                    batch_results.append(combined_results)
                 
                 # Update processed count and progress for individual items within batch
                 processed_count += 1
@@ -348,143 +372,128 @@ def find_top_3_classification_codes_batch(industries, encoder, qdrant, collectio
     
     return all_results
 
-# Smart batching logic for multiple files
-def calculate_file_processing_priority(uploaded_files):
-    """
-    Calculate processing priority based on file size and complexity
-    Returns: (small_files, medium_files, large_files)
-    """
-    small_files = []   # < 1MB or < 1000 records
-    medium_files = []  # 1MB-10MB or 1000-10000 records
-    large_files = []   # > 10MB or > 10000 records
-    
-    for file in uploaded_files:
-        file_size_mb = file.size / (1024 * 1024)
-        
-        # Quick record count estimation (rough)
-        if file.name.endswith('.csv'):
-            # Estimate records based on file size (rough)
-            estimated_records = file_size_mb * 1000  # rough estimate
-        else:  # Excel
-            estimated_records = file_size_mb * 500   # Excel is typically more compact
-        
-        if file_size_mb < 1 or estimated_records < 1000:
-            small_files.append((file, estimated_records))
-        elif file_size_mb < 10 or estimated_records < 10000:
-            medium_files.append((file, estimated_records))
-        else:
-            large_files.append((file, estimated_records))
-    
-    return small_files, medium_files, large_files
-
-# Thread-safe progress tracker
-class MultiFileProgressTracker:
+# Simplified progress tracker for parallel processing
+class ParallelProgressTracker:
     def __init__(self, total_files):
         self.total_files = total_files
         self.completed_files = 0
-        self.file_progress = {}
-        self.file_status = {}
+        self.failed_files = 0
         self.lock = Lock()
-        
-    def update_file_progress(self, filename, progress_pct, status="Processing"):
-        with self.lock:
-            self.file_progress[filename] = progress_pct
-            self.file_status[filename] = status
-            
-    def complete_file(self, filename, success=True):
+
+    def complete_file(self, success=True):
         with self.lock:
             self.completed_files += 1
-            self.file_progress[filename] = 100
-            self.file_status[filename] = "✅ Complete" if success else "❌ Failed"
-    
-    def get_overall_progress(self):
+            if not success:
+                self.failed_files += 1
+
+    def get_progress(self):
         with self.lock:
             if self.total_files == 0:
-                return 0
-            return (self.completed_files / self.total_files) * 100
+                return 0, 0, 0
+            return self.completed_files, self.failed_files, (self.completed_files / self.total_files) * 100
 
-# Enhanced concurrent file processor
-def process_multiple_files_hybrid(uploaded_files, encoder, qdrant, classification_dir, classification_type, progress_tracker, fine_tuned_classifier=None, use_fine_tuned=False):
+# Optimized parallel file processor
+def process_multiple_files_parallel(uploaded_files, encoder, qdrant, classification_dir, classification_type, progress_tracker, fine_tuned_classifier=None, use_fine_tuned=False, level_2_only=False, user_name=None):
     """
-    Hybrid approach: Smart batching + concurrent processing
+    True parallel processing of all files simultaneously with optimal thread count
     """
-    small_files, medium_files, large_files = calculate_file_processing_priority(uploaded_files)
-    
-    st.write(f"📊 **File Analysis**: {len(small_files)} small, {len(medium_files)} medium, {len(large_files)} large files")
-    
-    all_results = []
-    
-    # Process large files first, one at a time (to avoid memory issues)
-    if large_files:
-        st.write("🔄 **Processing large files sequentially...**")
-        for file_info in large_files:
-            file, estimated_records = file_info
-            progress_tracker.update_file_progress(file.name, 0, "Starting large file")
-            try:
-                if use_fine_tuned and fine_tuned_classifier:
-                    result = process_file_with_fine_tuned(file, fine_tuned_classifier, classification_dir, classification_type)
-                else:
-                    result = process_file_compact(file, encoder, qdrant, classification_dir, classification_type)
-                result['estimated_records'] = estimated_records
-                all_results.append(result)
-                progress_tracker.complete_file(file.name, True)
-            except Exception as e:
-                st.error(f"❌ Error processing large file {file.name}: {e}")
-                progress_tracker.complete_file(file.name, False)
-                all_results.append({'filename': file.name, 'error': str(e)})
-    
-    # Process medium files with limited concurrency
-    if medium_files:
-        st.write("⚡ **Processing medium files with limited concurrency...**")
-        max_concurrent_medium = min(3, len(medium_files))  # Max 3 concurrent medium files
+    # Calculate optimal number of threads based on system specs and file count
+    # For your 64GB RAM, 4-core system, we can handle more concurrent files
+    if len(uploaded_files) <= 10:
+        max_workers = min(8, len(uploaded_files))  # Standard parallel processing
+    else:
+        max_workers = 10  # For large batches like 146 files, use 10 threads for optimal throughput
+
+    st.write(f"🚀 **Processing {len(uploaded_files)} files in parallel using {max_workers} threads**")
+
+    def process_single_file(uploaded_file):
+        """Process a single file and handle all errors internally"""
+        start_time = time.time()
+        model_type = 'fine_tuned' if (use_fine_tuned and fine_tuned_classifier) else 'embedding'
         
-        def process_medium_file(file_info):
-            file, estimated_records = file_info
-            progress_tracker.update_file_progress(file.name, 0, "Processing medium file")
-            try:
-                if use_fine_tuned and fine_tuned_classifier:
-                    result = process_file_with_fine_tuned(file, fine_tuned_classifier, classification_dir, classification_type)
-                else:
-                    result = process_file_compact(file, encoder, qdrant, classification_dir, classification_type)
-                result['estimated_records'] = estimated_records
-                progress_tracker.complete_file(file.name, True)
-                return result
-            except Exception as e:
-                progress_tracker.complete_file(file.name, False)
-                return {'filename': file.name, 'error': str(e)}
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent_medium) as executor:
-            medium_results = list(executor.map(process_medium_file, medium_files))
-            all_results.extend(medium_results)
-    
-    # Process small files with high concurrency
-    if small_files:
-        st.write("🚀 **Processing small files with high concurrency...**")
-        max_concurrent_small = min(5, len(small_files))  # Max 5 concurrent small files
-        
-        def process_small_file(file_info):
-            file, estimated_records = file_info
-            progress_tracker.update_file_progress(file.name, 0, "Processing small file")
-            try:
-                if use_fine_tuned and fine_tuned_classifier:
-                    result = process_file_with_fine_tuned(file, fine_tuned_classifier, classification_dir, classification_type)
-                else:
-                    result = process_file_compact(file, encoder, qdrant, classification_dir, classification_type)
-                result['estimated_records'] = estimated_records
-                progress_tracker.complete_file(file.name, True)
-                return result
-            except Exception as e:
-                progress_tracker.complete_file(file.name, False)
-                return {'filename': file.name, 'error': str(e)}
-        
-        with concurrent.futures.ThreadPoolExecutor(max_workers=max_concurrent_small) as executor:
-            small_results = list(executor.map(process_small_file, small_files))
-            all_results.extend(small_results)
-    
-    return all_results
+        try:
+            if use_fine_tuned and fine_tuned_classifier:
+                result = process_file_with_fine_tuned(uploaded_file, fine_tuned_classifier, classification_dir, classification_type, level_2_only)
+            else:
+                result = process_file_compact(uploaded_file, encoder, qdrant, classification_dir, classification_type, level_2_only)
+
+            progress_tracker.complete_file(True)
+            
+            # Set user_name in result for consistency
+            result['user_name'] = user_name
+            
+            # Log successful file processing
+            if 'error' not in result:
+                log_successful_file(
+                    filename=result.get('original_filename', uploaded_file.name),
+                    user_name=user_name or 'Unknown',
+                    classification_type=result.get('classification_type', classification_type),
+                    model_type=result.get('model_type', model_type),
+                    records_processed=result.get('records', 0),
+                    processing_time=result.get('time', 0),
+                    speed=result.get('speed', 0),
+                    output_path=result.get('path'),
+                    level_2_only=result.get('level_2_only', level_2_only)
+                )
+            
+            return result
+
+        except Exception as e:
+            progress_tracker.complete_file(False)
+            processing_time = time.time() - start_time
+            
+            # Log failed file processing
+            error_type = type(e).__name__
+            log_failed_file(
+                filename=uploaded_file.name,
+                user_name=user_name or 'Unknown',
+                classification_type=classification_type,
+                model_type=model_type,
+                error_message=str(e),
+                error_type=error_type,
+                processing_time=processing_time,
+                additional_info={'traceback': traceback.format_exc()}
+            )
+            
+            return {
+                'filename': uploaded_file.name,
+                'error': str(e),
+                'error_type': error_type,
+                'records': 0,
+                'time': processing_time,
+                'speed': 0
+            }
+
+    # Process all files in parallel
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_file = {executor.submit(process_single_file, file): file for file in uploaded_files}
+
+        # Progress monitoring
+        progress_placeholder = st.empty()
+        results = []
+
+        # Collect results as they complete
+        for future in concurrent.futures.as_completed(future_to_file):
+            file = future_to_file[future]
+            result = future.result()
+            results.append(result)
+
+            # Update progress display
+            completed, failed, progress_pct = progress_tracker.get_progress()
+            with progress_placeholder.container():
+                col1, col2, col3 = st.columns([2, 1, 1])
+                with col1:
+                    st.progress(progress_pct / 100)
+                with col2:
+                    st.metric("Completed", completed)
+                with col3:
+                    st.metric("Failed", failed)
+
+    return results
 
 # Process file using fine-tuned model
-def process_file_with_fine_tuned(uploaded_file, fine_tuned_classifier, save_directory, classification_type="ISIC"):
+def process_file_with_fine_tuned(uploaded_file, fine_tuned_classifier, save_directory, classification_type="ISIC", level_2_only=False):
     """Process file using fine-tuned DistilBERT model"""
     start_time = time.time()
     
@@ -521,29 +530,116 @@ def process_file_with_fine_tuned(uploaded_file, fine_tuned_classifier, save_dire
     # Process with fine-tuned model
     st.info("🤖 Using fine-tuned DistilBERT model for classification")
     
-    # Batch process with fine-tuned model
+    # Helper functions (defined outside loop for better performance)
+    def is_valid_4digit_code(code):
+        """Check if code is a valid 4-digit ISIC code (handles int, float, string)"""
+        try:
+            # Convert to int to handle floats (e.g., 4726.0 -> 4726)
+            code_int = int(float(str(code)))
+            code_str = str(code_int)
+            # Check if it's exactly 4 digits
+            return len(code_str) == 4 and code_str.isdigit()
+        except (ValueError, TypeError):
+            return False
+    
+    def process_predictions(predictions, level_2_only):
+        """Process model predictions and extract L2/L4 codes"""
+        if level_2_only:
+            # Only extract Level 2 codes (derive from level 4 codes)
+            level_4_codes_raw = [pred['code'] for pred in predictions if is_valid_4digit_code(pred['code'])][:3]
+            
+            # Always derive level 2 code from each level 4 code (even if duplicates)
+            level_2_codes_list = []
+            for code in level_4_codes_raw:
+                try:
+                    code_int = int(float(str(code)))
+                    code_str = str(code_int)
+                    if len(code_str) == 4:
+                        l2_code = code_str[:2]
+                        level_2_codes_list.append(l2_code)
+                except (ValueError, TypeError):
+                    continue
+            
+            # Get unique codes first, then fill with duplicates to ensure 3 codes
+            level_2_codes = []
+            seen_l2 = set()
+            
+            # First, add unique L2 codes in order
+            for l2_code in level_2_codes_list:
+                if l2_code not in seen_l2:
+                    level_2_codes.append(l2_code)
+                    seen_l2.add(l2_code)
+                    if len(level_2_codes) >= 3:
+                        break
+            
+            # If we don't have 3 unique codes yet, fill with duplicates from the original list
+            while len(level_2_codes) < 3 and len(level_2_codes_list) > 0:
+                for l2_code in level_2_codes_list:
+                    level_2_codes.append(l2_code)
+                    if len(level_2_codes) >= 3:
+                        break
+            
+            # Pad with None to ensure exactly 3 results
+            level_2_codes += [None] * (3 - len(level_2_codes))
+            return level_2_codes
+        else:
+            # Extract level 4 codes and derive level 2 codes
+            level_4_codes_raw = [pred['code'] for pred in predictions if is_valid_4digit_code(pred['code'])][:3]
+            
+            level_4_codes = []
+            level_2_codes_list = []
+            
+            # Extract all valid codes and their corresponding L2 codes
+            for code in level_4_codes_raw:
+                try:
+                    code_int = int(float(str(code)))
+                    code_str = str(code_int)
+                    if len(code_str) == 4:
+                        level_4_codes.append(code_str)
+                        level_2_codes_list.append(code_str[:2])
+                except (ValueError, TypeError):
+                    continue
+            
+            # Get unique L2 codes in order, fill with duplicates if needed
+            level_2_codes = []
+            seen_l2 = set()
+            
+            # First, add unique L2 codes in order
+            for l2_code in level_2_codes_list:
+                if l2_code not in seen_l2:
+                    level_2_codes.append(l2_code)
+                    seen_l2.add(l2_code)
+                    if len(level_2_codes) >= 3:
+                        break
+            
+            # Fill with duplicates if needed
+            while len(level_2_codes) < 3 and len(level_2_codes_list) > 0:
+                for l2_code in level_2_codes_list:
+                    level_2_codes.append(l2_code)
+                    if len(level_2_codes) >= 3:
+                        break
+            
+            # Pad with None to ensure exactly 3 results each
+            level_2_codes += [None] * (3 - len(level_2_codes))
+            level_4_codes += [None] * (3 - len(level_4_codes))
+            
+            return level_2_codes + level_4_codes
+    
+    # Batch process with fine-tuned model using TRUE batch inference
     batch_results = []
-    batch_size = 32  # Smaller batches for fine-tuned model
+    batch_size = 64  # Larger batches for better GPU utilization
     
     for i in range(0, len(valid_industries), batch_size):
         batch = valid_industries[i:i + batch_size]
         
-        # Get predictions for batch
+        # Get predictions for entire batch at once (MUCH faster!)
+        batch_predictions_list = fine_tuned_classifier.predict_batch(batch, top_k=6)
+        
+        # Process each prediction in the batch
         batch_predictions = []
-        for text in batch:
-            predictions = fine_tuned_classifier.predict_single(text, top_k=6)  # Get more predictions
-
-            # Extract level 4 codes and derive level 2 codes
-            level_4_codes = [pred['code'] for pred in predictions if len(pred['code']) == 4][:3]
-            level_2_codes = list(dict.fromkeys([code[:2] for code in level_4_codes if len(code) == 4]))[:3]  # Remove duplicates, keep order
-
-            # Pad with None to ensure 3 results each
-            level_2_codes += [None] * (3 - len(level_2_codes))
-            level_4_codes += [None] * (3 - len(level_4_codes))
-
-            # Combine results: [level2_1, level2_2, level2_3, level4_1, level4_2, level4_3]
-            combined_codes = level_2_codes + level_4_codes
-            batch_predictions.append(combined_codes)
+        for predictions in batch_predictions_list:
+            result = process_predictions(predictions, level_2_only)
+            batch_predictions.append(result)
         
         batch_results.extend(batch_predictions)
         
@@ -555,21 +651,37 @@ def process_file_with_fine_tuned(uploaded_file, fine_tuned_classifier, save_dire
     # Create full results matching original dataframe
     full_results = []
     batch_idx = 0
-    
+
     for idx in df.index:
         if valid_mask.iloc[idx]:
             full_results.append(batch_results[batch_idx])
             batch_idx += 1
         else:
-            full_results.append([None, None, None, None, None, None])  # 6 columns for both levels
+            if level_2_only:
+                full_results.append([None, None, None])  # 3 columns for level 2 only
+            else:
+                full_results.append([None, None, None, None, None, None])  # 6 columns for both levels
 
-    # Add results to dataframe with both level 2 and level 4 classifications
-    results_df = pd.DataFrame(full_results, columns=[
-        'isic_level2_code_1', 'isic_level2_code_2', 'isic_level2_code_3',
-        'isic_level4_code_1', 'isic_level4_code_2', 'isic_level4_code_3'
-    ])
-    df[['isic_level2_code_1', 'isic_level2_code_2', 'isic_level2_code_3',
-        'isic_level4_code_1', 'isic_level4_code_2', 'isic_level4_code_3']] = results_df
+    # Add results to dataframe
+    if level_2_only:
+        results_df = pd.DataFrame(full_results, columns=[
+            'isic_code_1', 'isic_code_2', 'isic_code_3'
+        ])
+        # Convert codes to strings to prevent float conversion (only non-None values)
+        for col in results_df.columns:
+            results_df[col] = results_df[col].apply(lambda x: str(x) if x is not None and pd.notna(x) else None)
+        df[['isic_code_1', 'isic_code_2', 'isic_code_3']] = results_df
+    else:
+        results_df = pd.DataFrame(full_results, columns=[
+            'isic_level2_code_1', 'isic_level2_code_2', 'isic_level2_code_3',
+            'isic_level4_code_1', 'isic_level4_code_2', 'isic_level4_code_3'
+        ])
+        # Convert codes to strings to prevent float conversion (especially for L2 codes which are 2-digit)
+        # Only convert non-None values to strings
+        for col in results_df.columns:
+            results_df[col] = results_df[col].apply(lambda x: str(x) if x is not None and pd.notna(x) else None)
+        df[['isic_level2_code_1', 'isic_level2_code_2', 'isic_level2_code_3',
+            'isic_level4_code_1', 'isic_level4_code_2', 'isic_level4_code_3']] = results_df
     
     # Save file
     name_parts = uploaded_file.name.rsplit('.', 1)
@@ -623,7 +735,12 @@ def process_file_with_fine_tuned(uploaded_file, fine_tuned_classifier, save_dire
         'path': save_path,
         'filename': processed_filename,
         'file_data': file_data,
-        'mime_type': mime_type
+        'mime_type': mime_type,
+        'original_filename': uploaded_file.name,
+        'user_name': None,  # Will be set by caller
+        'classification_type': classification_type,
+        'model_type': 'fine_tuned',
+        'level_2_only': level_2_only
     }
 
 # Accuracy testing function
@@ -661,7 +778,7 @@ def run_accuracy_test(test_file, encoder, qdrant, fine_tuned_classifier, classif
         # Filter valid test data
         test_df = test_df.dropna(subset=['INDUSTRY', expected_col])
         test_df = test_df[test_df['INDUSTRY'].str.len() > 2]
-        test_df = test_df[test_df[expected_col].astype(str).str.len().isin([2, 4])]  # Both level 2 and 4 ISIC codes
+        test_df = test_df[test_df[expected_col].astype(str).str.len().isin([2, 4])]  # Both level 2 (2-digit) and 4 (4-digit) ISIC codes
         
         if len(test_df) == 0:
             st.error("❌ No valid test data found after filtering")
@@ -799,7 +916,7 @@ def find_top_3_classification_codes(industry, encoder, qdrant, collection_name="
     return results + [None] * (3 - len(results))
 
 # Compact progress function for better UX
-def process_file_compact(uploaded_file, encoder, qdrant, save_directory, classification_type="ISIC"):
+def process_file_compact(uploaded_file, encoder, qdrant, save_directory, classification_type="ISIC", level_2_only=False):
     """
     Compact version of file processing with minimal UI elements
     Returns processing results for history tracking
@@ -884,14 +1001,14 @@ def process_file_compact(uploaded_file, encoder, qdrant, save_directory, classif
     
     # Process with compact progress tracking
     collection_name = "industries" if classification_type == "ISIC" else "jobs"
-    batch_results = find_top_3_classification_codes_compact(industries_list, encoder, qdrant, progress_bar, status_text, metrics_container, collection_name)
+    batch_results = find_top_3_classification_codes_compact(industries_list, encoder, qdrant, progress_bar, status_text, metrics_container, collection_name, level_2_only=level_2_only)
     
     # Quick results assembly with improved validation handling
     if filtered_count < total_records:
         # Create results array matching original dataframe length
         full_results = []
         batch_idx = 0
-        
+
         for idx in df.index:
             if df.loc[idx, 'is_valid_for_processing']:
                 # Use classification results for valid rows
@@ -900,34 +1017,52 @@ def process_file_compact(uploaded_file, encoder, qdrant, save_directory, classif
             else:
                 # Skip classification for invalid rows (empty INDUSTRY or isic_class)
                 if classification_type == "ISIC":
-                    full_results.append([None, None, None, None, None, None])  # 6 columns for both levels
+                    if level_2_only:
+                        full_results.append([None, None, None])  # 3 columns for level 2 only
+                    else:
+                        full_results.append([None, None, None, None, None, None])  # 6 columns for both levels
                 else:
                     full_results.append([None, None, None])  # ISCO remains 3 columns
 
         if classification_type == "ISIC":
-            # ISIC with both level 2 and level 4 classifications
-            results_df = pd.DataFrame(full_results, columns=[
-                'isic_level2_code_1', 'isic_level2_code_2', 'isic_level2_code_3',
-                'isic_level4_code_1', 'isic_level4_code_2', 'isic_level4_code_3'
-            ])
+            if level_2_only:
+                # ISIC with level 2 only
+                results_df = pd.DataFrame(full_results, columns=[
+                    'isic_code_1', 'isic_code_2', 'isic_code_3'
+                ])
+            else:
+                # ISIC with both level 2 and level 4 classifications
+                results_df = pd.DataFrame(full_results, columns=[
+                    'isic_level2_code_1', 'isic_level2_code_2', 'isic_level2_code_3',
+                    'isic_level4_code_1', 'isic_level4_code_2', 'isic_level4_code_3'
+                ])
         else:
             # ISCO remains unchanged
             results_df = pd.DataFrame(full_results, columns=[f'{classification_type.lower()}_code_1', f'{classification_type.lower()}_code_2', f'{classification_type.lower()}_code_3'])
     else:
         if classification_type == "ISIC":
-            # ISIC with both level 2 and level 4 classifications
-            results_df = pd.DataFrame(batch_results, columns=[
-                'isic_level2_code_1', 'isic_level2_code_2', 'isic_level2_code_3',
-                'isic_level4_code_1', 'isic_level4_code_2', 'isic_level4_code_3'
-            ])
+            if level_2_only:
+                # ISIC with level 2 only
+                results_df = pd.DataFrame(batch_results, columns=[
+                    'isic_code_1', 'isic_code_2', 'isic_code_3'
+                ])
+            else:
+                # ISIC with both level 2 and level 4 classifications
+                results_df = pd.DataFrame(batch_results, columns=[
+                    'isic_level2_code_1', 'isic_level2_code_2', 'isic_level2_code_3',
+                    'isic_level4_code_1', 'isic_level4_code_2', 'isic_level4_code_3'
+                ])
         else:
             # ISCO remains unchanged
             results_df = pd.DataFrame(batch_results, columns=[f'{classification_type.lower()}_code_1', f'{classification_type.lower()}_code_2', f'{classification_type.lower()}_code_3'])
-    
+
     # Add classification codes to the dataframe
     if classification_type == "ISIC":
-        df[['isic_level2_code_1', 'isic_level2_code_2', 'isic_level2_code_3',
-            'isic_level4_code_1', 'isic_level4_code_2', 'isic_level4_code_3']] = results_df
+        if level_2_only:
+            df[['isic_code_1', 'isic_code_2', 'isic_code_3']] = results_df
+        else:
+            df[['isic_level2_code_1', 'isic_level2_code_2', 'isic_level2_code_3',
+                'isic_level4_code_1', 'isic_level4_code_2', 'isic_level4_code_3']] = results_df
     else:
         df[[f'{classification_type.lower()}_code_1', f'{classification_type.lower()}_code_2', f'{classification_type.lower()}_code_3']] = results_df
     
@@ -936,10 +1071,16 @@ def process_file_compact(uploaded_file, encoder, qdrant, save_directory, classif
     
     # Reorder columns to put classification codes after the original columns
     if classification_type == "ISIC":
-        # For ISIC, we have both level 2 and level 4 codes
-        code_prefixes = ['isic_level2_code', 'isic_level4_code']
-        original_cols = [col for col in df_output.columns if not any(col.startswith(prefix) for prefix in code_prefixes)]
-        code_cols = [col for col in df_output.columns if any(col.startswith(prefix) for prefix in code_prefixes)]
+        if level_2_only:
+            # For ISIC level 2 only, look for isic_code prefix
+            code_prefix = 'isic_code'
+            original_cols = [col for col in df_output.columns if not col.startswith(code_prefix)]
+            code_cols = [col for col in df_output.columns if col.startswith(code_prefix)]
+        else:
+            # For ISIC, we have both level 2 and level 4 codes
+            code_prefixes = ['isic_level2_code', 'isic_level4_code']
+            original_cols = [col for col in df_output.columns if not any(col.startswith(prefix) for prefix in code_prefixes)]
+            code_cols = [col for col in df_output.columns if any(col.startswith(prefix) for prefix in code_prefixes)]
     else:
         # For ISCO, keep existing logic
         code_prefix = f'{classification_type.lower()}_code'
@@ -1002,10 +1143,15 @@ def process_file_compact(uploaded_file, encoder, qdrant, save_directory, classif
         'path': save_path,
         'filename': processed_filename,
         'file_data': file_data,
-        'mime_type': mime_type
+        'mime_type': mime_type,
+        'original_filename': uploaded_file.name,
+        'user_name': None,  # Will be set by caller
+        'classification_type': classification_type,
+        'model_type': 'embedding',
+        'level_2_only': level_2_only
     }
 # Compact batch processing for minimal UI
-def find_top_3_classification_codes_compact(industries, encoder, qdrant, progress_bar, status_text, metrics_container, collection_name="industries", batch_size=256):
+def find_top_3_classification_codes_compact(industries, encoder, qdrant, progress_bar, status_text, metrics_container, collection_name="industries", batch_size=256, level_2_only=False):
     """Compact version with minimal UI updates"""
     all_results = []
     total_items = len(industries)
@@ -1033,26 +1179,39 @@ def find_top_3_classification_codes_compact(industries, encoder, qdrant, progres
             )
 
             if collection_name == "industries":  # ISIC classification
-                # Separate level 2 and level 4 codes
-                level_2_codes = []
-                level_4_codes = []
+                if level_2_only:
+                    # Only return Level 2 codes
+                    level_2_codes = []
+                    for hit in hits:
+                        code = hit.payload.get('code')
+                        level = hit.payload.get('level', 'Unknown')
+                        if level == 'Level 2' and len(level_2_codes) < 3:
+                            level_2_codes.append(code)
 
-                for hit in hits:
-                    code = hit.payload.get('code')
-                    level = hit.payload.get('level', 'Unknown')
+                    # Pad with None to ensure 3 results
+                    level_2_codes += [None] * (3 - len(level_2_codes))
+                    batch_results.append(level_2_codes)
+                else:
+                    # Separate level 2 and level 4 codes
+                    level_2_codes = []
+                    level_4_codes = []
 
-                    if level == 'Level 2' and len(level_2_codes) < 3:
-                        level_2_codes.append(code)
-                    elif level == 'Level 4' and len(level_4_codes) < 3:
-                        level_4_codes.append(code)
+                    for hit in hits:
+                        code = hit.payload.get('code')
+                        level = hit.payload.get('level', 'Unknown')
 
-                # Pad with None to ensure 3 results each
-                level_2_codes += [None] * (3 - len(level_2_codes))
-                level_4_codes += [None] * (3 - len(level_4_codes))
+                        if level == 'Level 2' and len(level_2_codes) < 3:
+                            level_2_codes.append(code)
+                        elif level == 'Level 4' and len(level_4_codes) < 3:
+                            level_4_codes.append(code)
 
-                # Combine results: [level2_1, level2_2, level2_3, level4_1, level4_2, level4_3]
-                combined_results = level_2_codes + level_4_codes
-                batch_results.append(combined_results)
+                    # Pad with None to ensure 3 results each
+                    level_2_codes += [None] * (3 - len(level_2_codes))
+                    level_4_codes += [None] * (3 - len(level_4_codes))
+
+                    # Combine results: [level2_1, level2_2, level2_3, level4_1, level4_2, level4_3]
+                    combined_results = level_2_codes + level_4_codes
+                    batch_results.append(combined_results)
             else:  # ISCO classification
                 codes = [hit.payload.get('code') for hit in hits]
                 batch_results.append(codes + [None] * (3 - len(codes)))
@@ -1283,9 +1442,22 @@ classification_type = st.radio(
 # Extract the classification type for easier handling
 selected_classification = "ISIC" if "ISIC" in classification_type else "ISCO"
 
+# ISIC Level selection (only for ISIC classification)
+isic_level_option = "Both Level 2 and Level 4"
+if selected_classification == "ISIC":
+    st.markdown("### 📊 Select ISIC Level")
+    isic_level_option = st.radio(
+        "Choose which ISIC levels to generate:",
+        ("Level 2 Only (2-digit Division codes)", "Both Level 2 and Level 4 (Division + Class codes)"),
+        help="Level 2 = 2-digit divisions (e.g., 01), Level 4 = 4-digit classes (e.g., 0111)"
+    )
+
 # Update title based on selection
 if selected_classification == "ISIC":
-    st.info("🏭 **ISIC Classification Selected** - Mapping industries to economic activity codes")
+    if "Level 2 Only" in isic_level_option:
+        st.info("🏭 **ISIC Classification Selected** - Generating Level 2 (Division) codes only")
+    else:
+        st.info("🏭 **ISIC Classification Selected** - Generating both Level 2 (Division) and Level 4 (Class) codes")
 else:
     st.info("👨‍💼 **ISCO Classification Selected** - Mapping to occupational codes")
 
@@ -1384,26 +1556,26 @@ if user_name:
     # Processing mode selection
     processing_mode = st.radio(
         "Choose processing mode:",
-        ("Single File", "Multiple Files (Batch Processing)"),
-        help="Single file for immediate processing, Multiple files for batch processing with smart optimization"
+        ("Single File", "Multiple Files (Parallel Processing)"),
+        help="Single file for immediate processing, Multiple files for true parallel processing (up to 10 files simultaneously)"
     )
     
     if processing_mode == "Single File":
         uploaded_files = st.file_uploader(
-            "Choose an Excel or CSV file", 
-            type=['xlsx', 'csv'], 
+            "Choose an Excel or CSV file",
+            type=['xlsx', 'csv'],
             accept_multiple_files=False,
-            key=f"single_file_uploader_{len(st.session_state.processed_files)}"
+            key="single_file_uploader"
         )
         if uploaded_files:
             uploaded_files = [uploaded_files]  # Convert to list for consistent handling
     else:
         uploaded_files = st.file_uploader(
-            "Choose multiple Excel or CSV files", 
-            type=['xlsx', 'csv'], 
+            "Choose multiple Excel or CSV files",
+            type=['xlsx', 'csv'],
             accept_multiple_files=True,
-            key=f"multi_file_uploader_{len(st.session_state.processed_files)}",
-            help="Select multiple files for batch processing. Files will be processed using smart batching based on size."
+            key="multi_file_uploader",
+            help="Select multiple files for batch processing. Files will be processed in parallel for maximum efficiency."
         )
     
     # Process files when uploaded
@@ -1422,14 +1594,34 @@ if user_name:
                 with st.container():
                     try:
                         # Process single file with model selection
-                        use_fine_tuned = (selected_classification == "ISIC" and 
-                                        model_selection == "Fine-tuned Model (Best Accuracy)" and 
+                        use_fine_tuned = (selected_classification == "ISIC" and
+                                        model_selection == "Fine-tuned Model (Best Accuracy)" and
                                         fine_tuned_classifier is not None)
-                        
+
+                        # Determine if Level 2 only mode is selected
+                        level_2_only = (selected_classification == "ISIC" and "Level 2 Only" in isic_level_option)
+
                         if use_fine_tuned:
-                            result = process_file_with_fine_tuned(uploaded_file, fine_tuned_classifier, classification_dir, selected_classification)
+                            result = process_file_with_fine_tuned(uploaded_file, fine_tuned_classifier, classification_dir, selected_classification, level_2_only)
                         else:
-                            result = process_file_compact(uploaded_file, encoder, qdrant, classification_dir, selected_classification)
+                            result = process_file_compact(uploaded_file, encoder, qdrant, classification_dir, selected_classification, level_2_only)
+                        
+                        # Set user name in result for logging
+                        result['user_name'] = user_name
+                        
+                        # Log successful processing
+                        if 'error' not in result:
+                            log_successful_file(
+                                filename=result.get('original_filename', uploaded_file.name),
+                                user_name=user_name,
+                                classification_type=result.get('classification_type', selected_classification),
+                                model_type=result.get('model_type', 'fine_tuned' if use_fine_tuned else 'embedding'),
+                                records_processed=result.get('records', 0),
+                                processing_time=result.get('time', 0),
+                                speed=result.get('speed', 0),
+                                output_path=result.get('path'),
+                                level_2_only=result.get('level_2_only', level_2_only)
+                            )
                         
                         # Add to processing history
                         st.session_state.processed_files.append({
@@ -1477,7 +1669,20 @@ if user_name:
                         st.info("💡 **Options:**\n- Click **Download** to get the file directly\n- Click **Process More Files** to continue with additional files\n- All files are saved to your server folder")
                         
                     except Exception as e:
+                        # Log failed file processing
+                        error_type = type(e).__name__
+                        log_failed_file(
+                            filename=uploaded_file.name,
+                            user_name=user_name,
+                            classification_type=selected_classification,
+                            model_type='fine_tuned' if use_fine_tuned else 'embedding',
+                            error_message=str(e),
+                            error_type=error_type,
+                            additional_info={'traceback': traceback.format_exc()}
+                        )
+                        
                         st.error(f"❌ **Error processing {uploaded_file.name}:** {e}")
+                        st.info(f"📝 **Logged to:** `logs/failed_files.log` - You can review failed files later")
                         with st.expander("🔍 Error Details"):
                             st.text(traceback.format_exc())
                         
@@ -1489,7 +1694,7 @@ if user_name:
                 st.markdown(f"### 🚀 Batch Processing: {len(uploaded_files)} files")
                 
                 # Initialize progress tracker
-                progress_tracker = MultiFileProgressTracker(len(uploaded_files))
+                progress_tracker = ParallelProgressTracker(len(uploaded_files))
                 
                 # Show file analysis
                 st.write("**📋 Files to process:**")
@@ -1502,13 +1707,16 @@ if user_name:
                 
                 try:
                     # Process multiple files with hybrid approach
-                    use_fine_tuned = (selected_classification == "ISIC" and 
-                                    model_selection == "Fine-tuned Model (Best Accuracy)" and 
+                    use_fine_tuned = (selected_classification == "ISIC" and
+                                    model_selection == "Fine-tuned Model (Best Accuracy)" and
                                     fine_tuned_classifier is not None)
-                    
-                    all_results = process_multiple_files_hybrid(
-                        uploaded_files, encoder, qdrant, classification_dir, 
-                        selected_classification, progress_tracker, fine_tuned_classifier, use_fine_tuned
+
+                    # Determine if Level 2 only mode is selected
+                    level_2_only = (selected_classification == "ISIC" and "Level 2 Only" in isic_level_option)
+
+                    all_results = process_multiple_files_parallel(
+                        uploaded_files, encoder, qdrant, classification_dir,
+                        selected_classification, progress_tracker, fine_tuned_classifier, use_fine_tuned, level_2_only, user_name
                     )
                     
                     total_time = time.time() - start_time
@@ -1583,8 +1791,14 @@ if user_name:
                     # Show failed files if any
                     if failed_results:
                         st.markdown("### ❌ Failed Files")
+                        st.info(f"📝 **All failed files have been logged to:** `logs/failed_files.log`")
                         for result in failed_results:
-                            st.error(f"**{result['filename']}**: {result['error']}")
+                            with st.expander(f"❌ {result['filename']}"):
+                                st.error(f"**Error:** {result['error']}")
+                                if 'error_type' in result:
+                                    st.write(f"**Error Type:** {result['error_type']}")
+                                st.write(f"**Processing Time:** {result.get('time', 0):.2f}s")
+                                st.write(f"**Records Attempted:** {result.get('records', 0)}")
                     
                 except Exception as e:
                     st.error(f"❌ **Batch processing failed:** {e}")
@@ -1609,13 +1823,13 @@ if user_name:
             )
         
         with col2:
-            st.markdown("#### 📦 Batch Mode")
+            st.markdown("#### 📦 Parallel Mode")
             st.info(
                 "• **Upload multiple** Excel or CSV files\n"
-                "• **Smart batching** based on file size\n"
-                "• **Concurrent processing** for efficiency\n"
-                "• **Bulk download** as ZIP file\n"
-                "• Ideal for **large batches**"
+                "• **True parallel processing** (up to 10 files)\n"
+                "• **Maximum efficiency** for large batches\n"
+                "• **Real-time progress** tracking\n"
+                "• **Bulk download** as ZIP file"
             )
         
         # Show sample data info

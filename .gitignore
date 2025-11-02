@@ -26,6 +26,7 @@ share/python-wheels/
 .installed.cfg
 *.egg
 MANIFEST
+outputs/
 
 # Virtual environments
 .env
@@ -41,6 +42,7 @@ venv.bak/
 .idea/
 *.swp
 *.swo
+.claude/
 
 # OS
 .DS_Store
@@ -53,3 +55,25 @@ logs/
 # Temporary files
 *.tmp
 *.temp
+
+# Test data files (sample inputs for testing)
+*Census_Occupation_Industry_*.xlsx
+*isic_test*.xlsx
+
+# Test/debugging scripts (keep in local dev only)
+test_accuracy.py
+quick_model_comparison.py
+
+# Excel temporary lock files
+~$*.xlsx
+~$*.xls
+
+# Windows null device file
+nul
+
+# Old processing log (superseded by new logging system)
+outputs/processing_log.txt
+
+# Training data output (large files)
+isic_training_data.json
+*_training_data.json
